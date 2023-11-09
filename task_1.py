@@ -1,22 +1,14 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+from torch.optim.lr_scheduler import StepLR  # Import the scheduler
+from torch.nn.utils.rnn import pad_sequence
 import datasets
-from transformers import BertTokenizerFast
 from conlleval import evaluate
 import itertools
+from collections import Counter
 
 
-# Define a Dataset class
-class NERDataset(Dataset):
-    def __init__(self, data):
-        self.data = data
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        return {
-            'input_ids': torch.tensor(self.data[idx]['input_ids'], dtype=torch.long),
-            'labels': torch.tensor(self.data[idx]['labels'], dtype=torch.long)
-        }
 # Build the vocabularies
 def build_vocabularies(dataset):
     # Build word vocabulary
@@ -34,37 +26,61 @@ def build_vocabularies(dataset):
     return word2idx, label2idx
 
 
-# Convert tokens to IDs
-def convert_word_to_id(sample):
-    return {
-        'input_ids': [word2idx.get(token, word2idx['UNK']) for token in sample['tokens']],
-        'labels': sample['labels']
-    }
-
-
 dataset = datasets.load_dataset("conll2003")
-word2idx, label2idx = build_vocabularies(dataset)
-
 # Remove 'pos tags' and 'chunk tags' columns
 dataset = dataset.remove_columns(['pos_tags', 'chunk_tags'])
-
 # Rename 'ner tags' to 'labels'
 dataset = dataset.rename_column('ner_tags', 'labels')
-dataset.map(convert_word_to_id)
-# Create DataLoader
-train_dataset = NERDataset(dataset['train'])
-train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+word2idx, label2idx = build_vocabularies(dataset)
+
+# Define a Dataset class
+class NERDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+        self.word2idx = word2idx
+        self.label2idx = label2idx
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        sample = self.data[idx]
+        input_ids = torch.tensor([self.word2idx.get(token, self.word2idx['<UNK>']) for token in sample['tokens']], dtype=torch.long)
+        labels = torch.tensor(sample['labels'], dtype=torch.long)
+        return input_ids, labels
+
+# Function to convert words to IDs and labels to IDs
+def convert_tokens_labels_to_ids(dataset, word2idx, label2idx):
+    def convert_word_to_id(sample):
+        return {
+            'tokens': [word2idx.get(token, word2idx['<UNK>']) for token in sample['tokens']],
+            'labels': [label2idx[label] for label in sample['labels']]
+        }
+    return dataset.map(convert_word_to_id)
+
+# Padding function
+def pad_collate(batch):
+    # Unzip the batch
+    input_ids, labels = zip(*batch)
+    # Pad the sequences
+    input_ids_padded = pad_sequence(input_ids, batch_first=True, padding_value=word2idx['<PAD>'])
+    labels_padded = pad_sequence(labels, batch_first=True, padding_value=label2idx['O'])
+    return input_ids_padded, labels_padded
+
+# Check if CUDA is available and set the default device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(device)
 
 # Define the BiLSTM model
 class BiLSTMForNER(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, lstm_hidden_dim, linear_output_dim, num_lstm_layers, lstm_dropout):
+    def __init__(self, vocab_size, label_vocab_size, embedding_dim, lstm_hidden_dim, linear_output_dim, num_lstm_layers, lstm_dropout):
         super(BiLSTMForNER, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
         self.bilstm = nn.LSTM(embedding_dim, lstm_hidden_dim, num_layers=num_lstm_layers, 
                               dropout=lstm_dropout, bidirectional=True, batch_first=True)
         self.linear = nn.Linear(lstm_hidden_dim * 2, linear_output_dim)  # Times 2 because of bidirection
         self.elu = nn.ELU()
-        self.classifier = nn.Linear(linear_output_dim, len(label2idx))  # Assuming label2idx is defined
+        self.classifier = nn.Linear(linear_output_dim, label_vocab_size)
 
     def forward(self, input_ids):
         embedded = self.embedding(input_ids)
@@ -74,69 +90,80 @@ class BiLSTMForNER(nn.Module):
         logits = self.classifier(elu_out)
         return logits
 
-# Assuming you have a vocab_size and a label2idx dictionary
+# Create DataLoader
+train_dataset = NERDataset(dataset['train'])
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=pad_collate)
+# Create DataLoaders for validation and test data
+val_dataset = NERDataset(dataset['validation'])
+val_loader = DataLoader(val_dataset, batch_size=32, collate_fn=pad_collate)
+
+test_dataset = NERDataset(dataset['test'])
+test_loader = DataLoader(test_dataset, batch_size=32, collate_fn=pad_collate)
+
 vocab_size = len(word2idx)
-model = BiLSTMForNER(vocab_size, 100, 256, 128, 1, 0.33)
-
-# Define loss function and optimizer
-loss_function = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-
-# Training loop
-for epoch in range(5):  # Let's assume 5 epochs
-    model.train()
-    for batch in train_loader:
-        input_ids = batch['input_ids']
-        labels = batch['labels']
-
-        # Reset gradients
-        optimizer.zero_grad()
-
-        # Forward pass
-        outputs = model(input_ids)
-        
-        # Reshape outputs and labels to compute loss
-        outputs = outputs.view(-1, outputs.shape[-1])
-        labels = labels.view(-1)
-
-        # Compute loss and backpropagate
-        loss = loss_function(outputs, labels)
-        loss.backward()
-        optimizer.step()
-    
-    print(f"Epoch {epoch + 1}, Loss: {loss.item()}")
-
+label_vocab_size=9
+model = BiLSTMForNER(vocab_size, 9, 100, 256, 128, 1, 0.33)
+model = model.to(device)
 # Map the labels back to their corresponding tag strings
 idx2tag = {idx: tag for tag, idx in label2idx.items()}
 
-# Implement the prediction loop for the validation set
-model.eval()  # Set the model to evaluation mode
-predictions = []
-with torch.no_grad():
-    for batch in DataLoader(NERDataset(dataset['validation']), batch_size=16):
-        input_ids = batch['input_ids']
-        # Forward pass
-        outputs = model(input_ids)
-        # Get the index of the highest logit
-        predictions.extend(outputs.argmax(dim=-1).tolist())
+# Define loss function and optimizer
+criterion = nn.CrossEntropyLoss(ignore_index=word2idx['<PAD>']).to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
 
-# Convert predictions and labels to tag names
-pred_tags = [
-    [idx2tag.get(idx) for idx in sentence]
-    for sentence in predictions
-]
-true_tags = [
-    [idx2tag.get(idx) for idx in sentence['labels']]
-    for sentence in dataset['validation']
-]
-
-# Flatten the lists for evaluation
-flattened_preds = [tag for sentence in pred_tags for tag in sentence]
-flattened_trues = [tag for sentence in true_tags for tag in sentence]
-
-# Evaluate the predictions
-precision, recall, f1 = evaluate(flattened_trues, flattened_preds)
-
-print(f"Precision: {precision}, Recall: {recall}, F1: {f1}")
+# Define the learning rate scheduler
+scheduler = StepLR(optimizer, step_size=1, gamma=0.1)
 
 
+def evaluate_model(model, data_loader):
+    model.eval()
+    true_labels = []
+    pred_labels = []
+
+    with torch.no_grad():
+        for input_ids, labels in data_loader:
+            # Forward pass
+            input_ids.to(device)
+            outputs = model(input_ids)
+
+            # Convert to probabilities and get the predicted labels
+            preds = outputs.argmax(-1)
+
+            # Iterate over the batch and collect non-padded values
+            for i in range(len(labels)):
+                true_sequence = labels[i][labels[i] != word2idx['<PAD>']]
+                pred_sequence = preds[i][:len(true_sequence)]  # Match true sequence length
+
+                true_labels.extend(true_sequence.tolist())
+                pred_labels.extend(pred_sequence.tolist())
+
+    # Convert to tags
+    true_tags = [idx2tag[idx] for idx in true_labels]
+    pred_tags = [idx2tag[idx] for idx in pred_labels]
+
+    # Calculate metrics
+    precision, recall, f1 = evaluate(true_tags, pred_tags)
+    return precision, recall, f1
+
+# Training loop (simplified, assuming all other necessary components are defined)
+for epoch in range(20):
+    model.train()
+    for batch in train_loader:
+        optimizer.zero_grad()
+        inputs, labels = batch
+        inputs, labels = inputs.to(device), labels.to(device)
+        outputs = model(inputs)
+        loss = criterion(outputs.view(-1, label_vocab_size), labels.view(-1))
+        loss.backward()
+        optimizer.step()
+    scheduler.step()  # Update the learning rate
+    # Evaluate on validation set
+    val_precision, val_recall, val_f1 = evaluate_model(model, val_loader)
+    print(f"Validation - Precision: {val_precision}, Recall: {val_recall}, F1: {val_f1}")
+    
+    print(f"Epoch {epoch + 1}, Loss: {loss.item()}")
+
+
+# Evaluate on test set
+precision, recall, f1 = evaluate_model(model, test_loader)
+print(f"Test - Precision: {precision}, Recall: {recall}, F1: {f1}")
